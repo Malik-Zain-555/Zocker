@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+import json
+from pathlib import Path
+import shutil
+import random
+
+# ============================================================
+#   ZOCKER STORAGE STRUCTURE
+#   ~/.zocker/
+#       containers/
+#           <name>/
+#               meta.json
+#               rootfs/
+#               logs.txt
+# ============================================================
+
+HOME = Path.home()
+ZOCKER_HOME = HOME / ".zocker"
+CONTAINERS_ROOT = ZOCKER_HOME / "containers"
+CONTAINERS_ROOT.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+#   RANDOM NAME + RANDOM COLOR
+# ============================================================
+
+ADJ = ["angry", "happy", "sleepy", "wild", "tiny", "rapid", "frozen", "crazy"]
+ANI = ["lion", "wolf", "eagle", "tiger", "shark", "panda", "cobra", "falcon"]
+
+COLORS = [
+    "\033[92m",  # green
+    "\033[93m",  # yellow
+    "\033[94m",  # blue
+    "\033[95m",  # magenta
+    "\033[96m",  # cyan
+]
+RESET = "\033[0m"
+
+
+def generate_name():
+    """Generate unique Docker-style container name."""
+    while True:
+        name = random.choice(ADJ) + "-" + random.choice(ANI)
+        if not (CONTAINERS_ROOT / name).exists():
+            return name
+
+
+# ============================================================
+#   META LOAD/SAVE HELPERS
+# ============================================================
+
+def load_meta(name):
+    """Load metadata JSON."""
+    meta_file = CONTAINERS_ROOT / name / "meta.json"
+    if not meta_file.exists():
+        return None
+    return json.load(open(meta_file))
+
+
+def save_meta(name, meta):
+    """Write metadata JSON."""
+    meta_file = CONTAINERS_ROOT / name / "meta.json"
+    json.dump(meta, open(meta_file, "w"), indent=4)
+
+
+# ============================================================
+#   CREATE CONTAINER (MANUAL MODE)
+#   user supplies runner + filename
+# ============================================================
+
+def cmd_create():
+    if len(sys.argv) < 4:
+        print("Usage: zocker create <runner> <file>")
+        return
+
+    runner = sys.argv[2]
+    filename = sys.argv[3]
+    name = generate_name()
+
+    folder = CONTAINERS_ROOT / name
+    rootfs = folder / "rootfs"
+    folder.mkdir()
+    rootfs.mkdir()
+
+    # Copy source file to container
+    if Path(filename).exists():
+        shutil.copy(filename, rootfs / filename)
+    else:
+        print("WARNING: source file not found. Empty container created.")
+
+    color = random.choice(COLORS)
+
+    # Metadata
+    meta = {
+        "name": name,
+        "status": "created",
+        "pid": None,
+        "runner": runner,
+        "command": [runner, filename],
+        "cpu": "high",
+        "color": color
+    }
+
+    save_meta(name, meta)
+
+    print(f"Container created successfully.")
+    print(f"Name: {name}")
+
+
+# ============================================================
+#   BUILD CONTAINER (AUTO MODE)
+#   Automatically detects file type and prepares environment
+# ============================================================
+
+def cmd_build():
+    if len(sys.argv) < 3:
+        print("Usage: zocker build <file>")
+        return
+
+    filename = sys.argv[2]
+
+    if not Path(filename).exists():
+        print("File not found:", filename)
+        return
+
+    ext = Path(filename).suffix
+    name = generate_name()
+
+    folder = CONTAINERS_ROOT / name
+    rootfs = folder / "rootfs"
+    folder.mkdir()
+    rootfs.mkdir()
+
+    shutil.copy(filename, rootfs / filename)
+
+    # Auto detection
+    if ext == ".cpp":
+        runner = "g++"
+        executable = "app"
+
+        print(f"Compiling {filename}...")
+        subprocess.run(["g++", filename, "-o", executable], cwd=rootfs)
+
+        default_cmd = ["./app"]
+
+    elif ext == ".py":
+        runner = "python3"
+        default_cmd = ["python3", filename]
+
+    elif ext == ".js":
+        runner = "node"
+        default_cmd = ["node", filename]
+
+    elif ext == ".sh":
+        runner = "bash"
+        default_cmd = ["bash", filename]
+
+    elif ext == ".html":
+        runner = "w3m"
+        default_cmd = ["w3m", filename]
+
+    else:
+        print("Unsupported file type:", ext)
+        return
+
+    color = random.choice(COLORS)
+
+    meta = {
+        "name": name,
+        "runner": runner,
+        "status": "built",
+        "pid": None,
+        "command": default_cmd,
+        "cpu": "high",
+        "color": color
+    }
+
+    save_meta(name, meta)
+
+    print("\nZocker Build Completed")
+    print("Container Name:", name)
+    print("Default Command:", default_cmd)
+    print("Status: built")
+
+
+# ============================================================
+#   INTERACTIVE CONTAINER SHELL
+# ============================================================
+
+def container_shell(name):
+    meta = load_meta(name)
+    color = meta["color"]
+    rootfs = CONTAINERS_ROOT / name / "rootfs"
+    log_file = CONTAINERS_ROOT / name / "logs.txt"
+
+    print(color + f"Entering container shell: {name}" + RESET)
+    print(color + "Type 'help' for commands." + RESET)
+
+    while True:
+        try:
+            cmd = input(color + f"{name} > " + RESET).strip()
+        except:
+            print("\nLeaving container shell...")
+            break
+
+        if cmd == "":
+            continue
+
+        # Exit
+        if cmd == "exit":
+            break
+
+        # Help
+        if cmd == "help":
+            print(color + """
+Zocker Shell Commands:
+  pwd              - show current directory
+  whoami           - show container name
+  ls               - list files
+  cat <file>       - read file
+  clear            - clear terminal
+  run <file>       - auto run/compile inside container
+  exit             - leave shell
+""" + RESET)
+            continue
+
+        if cmd == "whoami":
+            print(name)
+            continue
+
+        if cmd == "clear":
+            print("\n"*60)
+            continue
+
+        # run <file>
+        if cmd.startswith("run "):
+            file = cmd.split(" ",1)[1]
+            fpath = rootfs / file
+
+            if not fpath.exists():
+                print("File not inside container.")
+                continue
+
+            # C++
+            if file.endswith(".cpp"):
+                exe = file.replace(".cpp","")
+                subprocess.run(["g++", file, "-o", exe], cwd=rootfs)
+                subprocess.run(["./" + exe], cwd=rootfs)
+                continue
+
+            # Python
+            if file.endswith(".py"):
+                subprocess.run(["python3", file], cwd=rootfs)
+                continue
+
+            # JS
+            if file.endswith(".js"):
+                subprocess.run(["node", file], cwd=rootfs)
+                continue
+
+            # HTML
+            if file.endswith(".html"):
+                subprocess.run(["w3m", file], cwd=rootfs)
+                continue
+
+            # SH
+            if file.endswith(".sh"):
+                subprocess.run(["bash", file], cwd=rootfs)
+                continue
+
+        # Normal Linux commands inside rootfs
+        p = subprocess.Popen(
+            ["bash","-c",cmd],
+            cwd=rootfs,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        out, err = p.communicate()
+
+        if out:
+            print(color + out.decode(errors="ignore") + RESET, end="")
+        if err:
+            print(color + err.decode(errors="ignore") + RESET, end="")
+
+        with open(log_file, "ab") as lf:
+            lf.write(out)
+            lf.write(err)
+
+
+# ============================================================
+#   RUN CONTAINER (START SHELL)
+# ============================================================
+
+def cmd_run():
+    if len(sys.argv) < 3:
+        print("Usage: zocker run <container-name>")
+        return
+
+    name = sys.argv[2]
+    meta = load_meta(name)
+
+    if not meta:
+        print("Container not found.")
+        return
+
+    # Assign fake PID
+    if meta["pid"] is None:
+        meta["pid"] = random.randint(20000, 50000)
+
+    meta["status"] = "running"
+    save_meta(name, meta)
+
+    print(f"Container {name} started (PID={meta['pid']})")
+    container_shell(name)
+
+
+# ============================================================
+#   STOP CONTAINER
+# ============================================================
+
+def cmd_stop():
+    if len(sys.argv) < 3:
+        print("Usage: zocker stop <name>")
+        return
+
+    name = sys.argv[2]
+    meta = load_meta(name)
+
+    if not meta:
+        print("Container not found.")
+        return
+
+    if meta["status"] != "running":
+        print("Process not running.")
+        return
+
+    meta["status"] = "stopped"
+    meta["pid"] = None
+    save_meta(name, meta)
+
+    print(f"Container {name} stopped.")
+
+
+# ============================================================
+#   STOP ALL CONTAINERS
+# ============================================================
+def cmd_stop_all():
+    print("Stopping ALL running containers...\n")
+
+    for folder in CONTAINERS_ROOT.iterdir():
+        meta_file = folder / "meta.json"
+        if not meta_file.exists():
+            continue
+
+        meta = json.load(open(meta_file))
+
+        if meta["status"] == "running":
+            meta["status"] = "stopped"
+            meta["pid"] = None
+            save_meta(meta["name"], meta)
+            print(f"Stopped: {meta['name']}")
+
+    print("\nAll running containers stopped.")
+
+
+# ============================================================
+#   REMOVE CONTAINER
+# ============================================================
+
+def cmd_rm():
+    if len(sys.argv) < 3:
+        print("Usage: zocker rm <name>")
+        return
+
+    name = sys.argv[2]
+    meta = load_meta(name)
+
+    if not meta:
+        print("Container not found.")
+        return
+
+    if meta["status"] != "stopped":
+        print("Stop container first.")
+        return
+
+    shutil.rmtree(CONTAINERS_ROOT / name)
+    print(f"Container {name} removed.")
+
+
+# ============================================================
+#   REMOVE ALL STOPPED CONTAINERS
+# ============================================================
+def cmd_rm_all():
+    print("Removing ALL stopped containers...\n")
+
+    removed_any = False
+
+    for folder in CONTAINERS_ROOT.iterdir():
+        meta_file = folder / "meta.json"
+        if not meta_file.exists():
+            continue
+
+        meta = json.load(open(meta_file))
+
+        # only stopped containers can be removed
+        if meta["status"] == "stopped":
+            shutil.rmtree(folder)
+            print(f"Removed: {meta['name']}")
+            removed_any = True
+
+    if not removed_any:
+        print("No stopped containers to remove.")
+    else:
+        print("\nAll stopped containers removed.")
+
+
+# ============================================================
+#   LIST CONTAINERS
+# ============================================================
+
+def cmd_ps():
+    rows = []
+    headers = ["Name", "PID", "Status", "Command"]
+
+    for folder in CONTAINERS_ROOT.iterdir():
+        meta_file = folder / "meta.json"
+        if meta_file.exists():
+            m = json.load(open(meta_file))
+            rows.append([
+                m["name"],
+                str(m["pid"]),
+                m["status"],
+                " ".join(m["command"])
+            ])
+
+    if not rows:
+        print("No containers found.")
+        return
+
+    # table formatting
+    print("+----------------------+--------+----------+-------------------------------+")
+    print("| {:<20} | {:<6} | {:<8} | {:<29} |".format(*headers))
+    print("+----------------------+--------+----------+-------------------------------+")
+
+    for r in rows:
+        print("| {:<20} | {:<6} | {:<8} | {:<29} |".format(*r))
+
+    print("+----------------------+--------+----------+-------------------------------+")
+
+
+# ============================================================
+#   LOGS
+# ============================================================
+
+def cmd_logs():
+    name = sys.argv[2]
+    log_file = CONTAINERS_ROOT / name / "logs.txt"
+    if log_file.exists():
+        print(log_file.read_text())
+    else:
+        print("No logs found.")
+
+
+# ============================================================
+#   INSPECT
+# ============================================================
+
+def cmd_inspect():
+    name = sys.argv[2]
+    meta_file = CONTAINERS_ROOT / name / "meta.json"
+    if meta_file.exists():
+        print(meta_file.read_text())
+    else:
+        print("Container not found.")
+
+
+# ============================================================
+#   EXPORT CONTAINER (SAVE AS .tar)
+# ============================================================
+def cmd_export():
+    if len(sys.argv) < 4:
+        print("Usage: zocker export <name> <output.tar>")
+        return
+
+    name = sys.argv[2]
+    outfile = sys.argv[3]
+
+    container_path = CONTAINERS_ROOT / name
+
+    if not container_path.exists():
+        print("Container not found.")
+        return
+
+    # make tar file
+    shutil.make_archive(outfile.replace(".tar",""), 'tar', container_path)
+
+    print(f"Container '{name}' exported to: {outfile}")
+
+
+# ============================================================
+#   IMPORT CONTAINER (LOAD FROM .tar)
+# ============================================================
+def cmd_import():
+    if len(sys.argv) < 3:
+        print("Usage: zocker import <file.tar>")
+        return
+
+    tarfile = sys.argv[2]
+
+    if not Path(tarfile).exists():
+        print("File not found:", tarfile)
+        return
+
+    # assign new name so no conflict
+    newname = generate_name()
+    newpath = CONTAINERS_ROOT / newname
+    newpath.mkdir()
+
+    # extract tar
+    shutil.unpack_archive(tarfile, newpath)
+
+    # fix metadata name
+    meta_file = newpath / "meta.json"
+    if meta_file.exists():
+        meta = json.load(open(meta_file))
+        meta["name"] = newname
+        meta["pid"] = None
+        save_meta(newname, meta)
+
+    print(f"Container imported as: {newname}")
+
+
+
+# ============================================================
+#   COMMAND ROUTER
+# ============================================================
+
+if len(sys.argv) < 2:
+    print("No command.")
+    sys.exit(1)
+
+cmd = sys.argv[1]
+
+if cmd == "create":
+    cmd_create()
+elif cmd == "build":
+    cmd_build()
+elif cmd == "run":
+    cmd_run()
+elif cmd == "stop":
+    cmd_stop()
+elif cmd == "stop-all":
+    cmd_stop_all()
+elif cmd == "rm":
+    cmd_rm()
+elif cmd == "rm-all":
+    cmd_rm_all()
+elif cmd == "export":
+    cmd_export()
+elif cmd == "import":
+    cmd_import()
+elif cmd == "ps":
+    cmd_ps()
+elif cmd == "logs":
+    cmd_logs()
+elif cmd == "inspect":
+    cmd_inspect()
+else:
+    print("Unknown command:", cmd)
