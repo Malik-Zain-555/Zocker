@@ -8,13 +8,22 @@ import shutil
 import random
 
 # ============================================================
-#   ZOCKER STORAGE STRUCTURE
-#   ~/.zocker/
-#       containers/
-#           <name>/
-#               meta.json
-#               rootfs/
-#               logs.txt
+#  ZOCKER DIRECTORY LAYOUT
+#  ~/.zocker/
+#     containers/
+#        <name>/
+#           meta.json
+#           fs/
+#              lower/
+#              upper/
+#              work/
+#              merged/
+#           logs.txt
+#
+#  "lower"  = base read-only layer
+#  "upper"  = writes (copy-on-write)
+#  "work"   = required by overlayfs
+#  "merged" = what the container actually sees
 # ============================================================
 
 HOME = Path.home()
@@ -22,8 +31,16 @@ ZOCKER_HOME = HOME / ".zocker"
 CONTAINERS_ROOT = ZOCKER_HOME / "containers"
 CONTAINERS_ROOT.mkdir(parents=True, exist_ok=True)
 
+# Root / isolation helpers
+def is_root():
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        # Non-POSIX (e.g. Windows) – treat as non-root
+        return False
+
 # ============================================================
-#   RANDOM NAME + RANDOM COLOR
+#  RANDOM NAMES + COLORS
 # ============================================================
 
 ADJ = ["angry", "happy", "sleepy", "wild", "tiny", "rapid", "frozen", "crazy"]
@@ -38,9 +55,20 @@ COLORS = [
 ]
 RESET = "\033[0m"
 
+INSTALL_HINTS = {
+    "python3": "sudo apt install python3",
+    "node": "sudo apt install nodejs",
+    "g++": "sudo apt install g++",
+    "w3m": "sudo apt install w3m",
+    "bash": "bash is usually installed by default on Linux",
+    "unshare": "sudo apt install util-linux",
+    "chroot": "chroot is part of coreutils/util-linux on most distros",
+}
+
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 def generate_name():
-    """Generate unique Docker-style container name."""
+    """Generate a unique Docker-style container name."""
     while True:
         name = random.choice(ADJ) + "-" + random.choice(ANI)
         if not (CONTAINERS_ROOT / name).exists():
@@ -48,26 +76,227 @@ def generate_name():
 
 
 # ============================================================
-#   META LOAD/SAVE HELPERS
+#  FS HELPERS (OVERLAY PATHS)
+# ============================================================
+
+def get_fs_paths(name: str):
+    """
+    Return (base, lower, upper, work, merged) dirs for a container.
+    base = ~/.zocker/containers/<name>/fs
+    """
+    base = CONTAINERS_ROOT / name / "fs"
+    lower = base / "lower"
+    upper = base / "upper"
+    work = base / "work"
+    merged = base / "merged"
+    return base, lower, upper, work, merged
+
+
+def ensure_fs_tree(name: str):
+    """
+    Make sure fs/{lower,upper,work,merged} exist. Does NOT mount overlay.
+    """
+    base, lower, upper, work, merged = get_fs_paths(name)
+    for d in (base, lower, upper, work, merged):
+        d.mkdir(parents=True, exist_ok=True)
+    return base, lower, upper, work, merged
+
+
+def setup_overlay(name: str):
+    """
+    Try to mount overlayfs for this container.
+    Returns (rootdir, overlay_active: bool)
+
+    rootdir is where shell should chdir (merged if overlay OK, else lower).
+    """
+    base, lower, upper, work, merged = ensure_fs_tree(name)
+
+    if not is_root():
+        print("[overlayfs] Not running as root – cannot mount overlay.")
+        print("[overlayfs] Falling back to plain lower dir (no COW).")
+        return lower, False
+
+    # Attempt overlay mount (needs root). If it fails, we fall back.
+    mount_cmd = [
+        "mount",
+        "-t", "overlay",
+        f"zocker-{name}",
+        "-o", f"lowerdir={lower},upperdir={upper},workdir={work}",
+        str(merged),
+    ]
+
+    try:
+        result = subprocess.run(
+            mount_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.returncode == 0:
+            print(f"[overlayfs] Mounted for container {name}")
+            return merged, True
+        else:
+            print(f"[overlayfs] Mount failed for {name}: {result.stderr.strip()}")
+            print("[overlayfs] Falling back to plain lower dir (no COW).")
+            return lower, False
+    except FileNotFoundError:
+        print("[overlayfs] 'mount' command not found. Falling back to lower dir.")
+        return lower, False
+
+
+def teardown_overlay(name: str, overlay_active: bool):
+    """
+    If overlay was active, try to unmount merged folder.
+    """
+    if not overlay_active:
+        return
+
+    _, _, _, _, merged = get_fs_paths(name)
+    if not merged.exists():
+        return
+
+    umount_cmd = ["umount", str(merged)]
+    try:
+        result = subprocess.run(
+            umount_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if result.returncode == 0:
+            print(f"[overlayfs] Unmounted for container {name}")
+        else:
+            print(f"[overlayfs] umount failed for {name}: {result.stderr.strip()}")
+    except FileNotFoundError:
+        print("[overlayfs] 'umount' command not found (skipping).")
+
+
+# ============================================================
+#  META HELPERS
 # ============================================================
 
 def load_meta(name):
-    """Load metadata JSON."""
     meta_file = CONTAINERS_ROOT / name / "meta.json"
     if not meta_file.exists():
         return None
-    return json.load(open(meta_file))
+    with open(meta_file, "r") as f:
+        return json.load(f)
 
 
 def save_meta(name, meta):
-    """Write metadata JSON."""
     meta_file = CONTAINERS_ROOT / name / "meta.json"
-    json.dump(meta, open(meta_file, "w"), indent=4)
+    with open(meta_file, "w") as f:
+        json.dump(meta, f, indent=4)
 
 
 # ============================================================
-#   CREATE CONTAINER (MANUAL MODE)
-#   user supplies runner + filename
+#  DEPENDENCY CHECK
+# ============================================================
+
+def check_dependency(bin_name):
+    from shutil import which
+    return which(bin_name) is not None
+
+
+def record_and_report_deps(meta, deps):
+    dep_status = {}
+    print("\nChecking dependencies:")
+    for dep in deps:
+        if check_dependency(dep):
+            print(f"  [OK] {dep} found")
+            dep_status[dep] = "found"
+        else:
+            print(f"  [MISSING] {dep} NOT found")
+            print("    Install with:", INSTALL_HINTS.get(dep, "install manually"))
+            dep_status[dep] = "missing"
+    meta["deps"] = dep_status
+    print("")
+
+
+# ============================================================
+#  CGROUP HELPERS (VERY SIMPLE, BEST-EFFORT)
+# ============================================================
+
+def setup_cgroup(name: str, meta: dict):
+    """
+    Very simple cgroup v2 setup (best-effort).
+    It tries to:
+      - create /sys/fs/cgroup/zocker/<name>
+      - optionally set cpu and memory limits from meta["limits"]
+    """
+    if not is_root():
+        return None
+
+    if not CGROUP_ROOT.exists():
+        print("[cgroup] /sys/fs/cgroup not available, skipping cgroup setup.")
+        return None
+
+    cg_base = CGROUP_ROOT / "zocker"
+    cg_path = cg_base / name
+
+    try:
+        cg_path.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        print("[cgroup] Permission denied creating cgroup folder, skipping.")
+        return None
+
+    limits = meta.get("limits", {})
+    # CPU limit: expect something like {"cpu.max": "50000 100000"}
+    cpu_max = limits.get("cpu.max")
+    if cpu_max:
+        try:
+            (cg_path / "cpu.max").write_text(cpu_max)
+            print(f"[cgroup] cpu.max set to {cpu_max}")
+        except Exception as e:
+            print(f"[cgroup] Failed to set cpu.max: {e}")
+
+    mem_max = limits.get("memory.max")
+    if mem_max:
+        try:
+            (cg_path / "memory.max").write_text(str(mem_max))
+            print(f"[cgroup] memory.max set to {mem_max}")
+        except Exception as e:
+            print(f"[cgroup] Failed to set memory.max: {e}")
+
+    meta["cgroup_path"] = str(cg_path)
+    return cg_path
+
+
+def add_pid_to_cgroup(cg_path: Path, pid: int):
+    """
+    Add a pid to the cgroup's cgroup.procs (best-effort).
+    """
+    try:
+        procs_file = cg_path / "cgroup.procs"
+        procs_file.write_text(str(pid))
+        print(f"[cgroup] Added PID {pid} to {procs_file}")
+    except Exception as e:
+        print(f"[cgroup] Failed to add PID to cgroup: {e}")
+
+
+def teardown_cgroup(meta: dict):
+    """
+    Try to remove cgroup directory on container stop.
+    """
+    if not is_root():
+        return
+
+    cg_path_str = meta.get("cgroup_path")
+    if not cg_path_str:
+        return
+
+    cg_path = Path(cg_path_str)
+    try:
+        # Try to remove; will fail if processes still inside
+        cg_path.rmdir()
+        print(f"[cgroup] Removed cgroup {cg_path}")
+    except Exception:
+        # Ignore if busy
+        pass
+
+
+# ============================================================
+#  CREATE (MANUAL)
 # ============================================================
 
 def cmd_create():
@@ -77,41 +306,47 @@ def cmd_create():
 
     runner = sys.argv[2]
     filename = sys.argv[3]
+
     name = generate_name()
-
     folder = CONTAINERS_ROOT / name
-    rootfs = folder / "rootfs"
-    folder.mkdir()
-    rootfs.mkdir()
+    folder.mkdir(parents=True)
 
-    # Copy source file to container
+    _, lower, upper, work, merged = ensure_fs_tree(name)
+
     if Path(filename).exists():
-        shutil.copy(filename, rootfs / filename)
+        shutil.copy(filename, lower / filename)
     else:
-        print("WARNING: source file not found. Empty container created.")
+        print("WARNING: source file not found; container created without it.")
 
     color = random.choice(COLORS)
 
-    # Metadata
     meta = {
         "name": name,
         "status": "created",
-        "pid": None,
         "runner": runner,
         "command": [runner, filename],
+        "pid": None,
+        "color": color,
         "cpu": "high",
-        "color": color
+        "overlay": False,
+        "limits": {
+            # example soft limits – can be tuned per container
+            # cgroup v2 style values:
+            # cpu.max: <max> <period> (e.g. 50000 100000 => 50% CPU)
+            "cpu.max": "max 100000",
+            # memory.max: bytes, e.g. "536870912" => 512MB
+            "memory.max": "1073741824",
+        },
     }
 
+    record_and_report_deps(meta, [runner])
     save_meta(name, meta)
 
-    print(f"Container created successfully.")
-    print(f"Name: {name}")
+    print("Container created:", name)
 
 
 # ============================================================
-#   BUILD CONTAINER (AUTO MODE)
-#   Automatically detects file type and prepares environment
+#  BUILD (AUTO)
 # ============================================================
 
 def cmd_build():
@@ -120,29 +355,26 @@ def cmd_build():
         return
 
     filename = sys.argv[2]
-
     if not Path(filename).exists():
         print("File not found:", filename)
         return
 
     ext = Path(filename).suffix
     name = generate_name()
-
     folder = CONTAINERS_ROOT / name
-    rootfs = folder / "rootfs"
-    folder.mkdir()
-    rootfs.mkdir()
+    folder.mkdir(parents=True)
 
-    shutil.copy(filename, rootfs / filename)
+    _, lower, upper, work, merged = ensure_fs_tree(name)
+    shutil.copy(filename, lower / filename)
 
-    # Auto detection
+    runner = None
+    default_cmd = None
+
     if ext == ".cpp":
         runner = "g++"
-        executable = "app"
-
-        print(f"Compiling {filename}...")
-        subprocess.run(["g++", filename, "-o", executable], cwd=rootfs)
-
+        exe = "app"
+        print("Compiling inside container 'lower' layer...")
+        subprocess.run(["g++", filename, "-o", exe], cwd=lower)
         default_cmd = ["./app"]
 
     elif ext == ".py":
@@ -169,60 +401,166 @@ def cmd_build():
 
     meta = {
         "name": name,
-        "runner": runner,
         "status": "built",
-        "pid": None,
+        "runner": runner,
         "command": default_cmd,
+        "pid": None,
+        "color": color,
         "cpu": "high",
-        "color": color
+        "overlay": False,
+        "limits": {
+            "cpu.max": "max 100000",
+            "memory.max": "1073741824",
+        },
     }
 
+    record_and_report_deps(meta, [runner])
     save_meta(name, meta)
 
     print("\nZocker Build Completed")
-    print("Container Name:", name)
-    print("Default Command:", default_cmd)
+    print("Container:", name)
+    print("Default command:", default_cmd)
     print("Status: built")
 
 
 # ============================================================
-#   INTERACTIVE CONTAINER SHELL
+#  REAL BASH SHELL (chroot + namespaces when available)
 # ============================================================
 
-def container_shell(name):
+def container_true_shell(name, rootdir, meta):
+    env = {}
+    # Minimal, container-y environment
+    env["PS1"] = f"{name}# "
+    env["ZOCKER_CONTAINER"] = name
+    env["HOME"] = "/root"
+    env["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+    print("\n[Entering REAL container shell]")
+    print("This shell tries to use chroot + Linux namespaces if available.")
+    print("Type 'exit' to come back.\n")
+
+    rootdir = Path(rootdir)
+
+    # Prefer full isolation via unshare + chroot, if root and util available
+    if is_root() and check_dependency("unshare"):
+        cmd = [
+            "unshare",
+            "--uts",
+            "--ipc",
+            "--pid",
+            "--net",
+            "--mount-proc",
+            "--fork",
+            "chroot",
+            str(rootdir),
+            "bash",
+        ]
+        try:
+            # Best-effort: also join cgroup if configured
+            cg_path_str = meta.get("cgroup_path")
+            if cg_path_str:
+                # We can't directly stuff the bash PID beforehand, but bash
+                # will be the only heavy process anyway; user can manually
+                # echo $$ > cgroup.procs from inside if they want.
+                print(f"[cgroup] Shell will run under cgroup: {cg_path_str}")
+            subprocess.call(cmd, env=env)
+        except FileNotFoundError:
+            print("unshare or chroot not found; falling back to chroot-only / plain bash.")
+    elif is_root() and check_dependency("chroot"):
+        # Chroot-only isolation
+        cmd = ["chroot", str(rootdir), "bash"]
+        subprocess.call(cmd, env=env)
+    else:
+        # Non-root fallback: just cd into the container FS
+        print("[isolation] Not root – cannot chroot or unshare. ")
+        print("            Running normal bash with cwd inside container FS.")
+        subprocess.call(["bash"], cwd=rootdir, env=env)
+
+    print("\n[Leaving REAL container shell]\n")
+
+
+# ============================================================
+#  ZOCKER SHELL (COMMAND DISPATCHER)
+# ============================================================
+
+def run_in_container_fs(rootdir: Path, cmd_list, use_chroot: bool, meta: dict):
+    """
+    Helper: run a command either directly in rootdir (non-root)
+    or via chroot <rootdir> (root).
+    """
+    rootdir = Path(rootdir)
+    env = os.environ.copy()
+    env["ZOCKER_CONTAINER"] = meta.get("name", "unknown")
+
+    if is_root() and use_chroot and check_dependency("chroot"):
+        full_cmd = ["chroot", str(rootdir)] + cmd_list
+        proc = subprocess.Popen(
+            full_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+    else:
+        proc = subprocess.Popen(
+            cmd_list,
+            cwd=rootdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+
+    # Try to also drop this process into cgroup (best-effort)
+    if is_root():
+        cg_path_str = meta.get("cgroup_path")
+        if cg_path_str:
+            try:
+                add_pid_to_cgroup(Path(cg_path_str), proc.pid)
+            except Exception:
+                pass
+
+    out, err = proc.communicate()
+    return out, err
+
+
+def container_shell(name, rootdir):
     meta = load_meta(name)
-    color = meta["color"]
-    rootfs = CONTAINERS_ROOT / name / "rootfs"
+    if not meta:
+        print("Container not found.")
+        return
+
+    color = meta.get("color", RESET)
     log_file = CONTAINERS_ROOT / name / "logs.txt"
 
     print(color + f"Entering container shell: {name}" + RESET)
     print(color + "Type 'help' for commands." + RESET)
 
+    use_chroot = True  # we decide inside helper based on root + chroot
+
     while True:
         try:
             cmd = input(color + f"{name} > " + RESET).strip()
-        except:
+        except (KeyboardInterrupt, EOFError):
             print("\nLeaving container shell...")
             break
 
         if cmd == "":
             continue
 
-        # Exit
         if cmd == "exit":
+            print("Leaving container shell...")
             break
 
-        # Help
         if cmd == "help":
             print(color + """
 Zocker Shell Commands:
-  pwd              - show current directory
+  pwd              - show current dir (inside container)
   whoami           - show container name
   ls               - list files
   cat <file>       - read file
-  clear            - clear terminal
-  run <file>       - auto run/compile inside container
-  exit             - leave shell
+  clear            - clear screen
+  run <file>       - auto run/compile (.cpp, .py, .js, .sh, .html)
+  shell            - drop into REAL bash inside container (chroot + namespaces)
+  exit             - leave this shell
 """ + RESET)
             continue
 
@@ -231,53 +569,106 @@ Zocker Shell Commands:
             continue
 
         if cmd == "clear":
-            print("\n"*60)
+            print("\n" * 60)
+            continue
+
+        if cmd == "shell":
+            container_true_shell(name, rootdir, meta)
+            continue
+
+        if cmd == "bash":
+            print("Use 'shell' command instead of directly running bash.")
             continue
 
         # run <file>
         if cmd.startswith("run "):
-            file = cmd.split(" ",1)[1]
-            fpath = rootfs / file
+            file = cmd.split(" ", 1)[1]
+            fpath = Path(rootdir) / file
 
             if not fpath.exists():
-                print("File not inside container.")
+                print("File not found in container.")
                 continue
 
-            # C++
+            # C++ ----------------------------------------------------------
             if file.endswith(".cpp"):
-                exe = file.replace(".cpp","")
-                subprocess.run(["g++", file, "-o", exe], cwd=rootfs)
-                subprocess.run(["./" + exe], cwd=rootfs)
+                exe = file.replace(".cpp", "")
+                if not check_dependency("g++"):
+                    print("[MISSING] g++ not found.")
+                    print("          Install with:", INSTALL_HINTS["g++"])
+                else:
+                    # compile
+                    compile_cmd = ["bash", "-c", f"g++ {file} -o {exe}"]
+                    out, err = run_in_container_fs(rootdir, compile_cmd, use_chroot, meta)
+                    if out:
+                        print(color + out.decode(errors="ignore") + RESET, end="")
+                    if err:
+                        print(color + err.decode(errors="ignore") + RESET, end="")
+                    # run
+                    run_cmd = ["bash", "-c", f"./{exe}"]
+                    out, err = run_in_container_fs(rootdir, run_cmd, use_chroot, meta)
+                    if out:
+                        print(color + out.decode(errors="ignore") + RESET, end="")
+                    if err:
+                        print(color + err.decode(errors="ignore") + RESET, end="")
                 continue
 
-            # Python
+            # Python -------------------------------------------------------
             if file.endswith(".py"):
-                subprocess.run(["python3", file], cwd=rootfs)
+                if not check_dependency("python3"):
+                    print("[MISSING] python3 not found.")
+                    print("          Install with:", INSTALL_HINTS["python3"])
+                else:
+                    run_cmd = ["bash", "-c", f"python3 {file}"]
+                    out, err = run_in_container_fs(rootdir, run_cmd, use_chroot, meta)
+                    if out:
+                        print(color + out.decode(errors="ignore") + RESET, end="")
+                    if err:
+                        print(color + err.decode(errors="ignore") + RESET, end="")
                 continue
 
-            # JS
+            # JS -----------------------------------------------------------
             if file.endswith(".js"):
-                subprocess.run(["node", file], cwd=rootfs)
+                if not check_dependency("node"):
+                    print("[MISSING] node not found.")
+                    print("          Install with:", INSTALL_HINTS["node"])
+                else:
+                    run_cmd = ["bash", "-c", f"node {file}"]
+                    out, err = run_in_container_fs(rootdir, run_cmd, use_chroot, meta)
+                    if out:
+                        print(color + out.decode(errors="ignore") + RESET, end="")
+                    if err:
+                        print(color + err.decode(errors="ignore") + RESET, end="")
                 continue
 
-            # HTML
+            # HTML ---------------------------------------------------------
             if file.endswith(".html"):
-                subprocess.run(["w3m", file], cwd=rootfs)
+                if not check_dependency("w3m"):
+                    print("[MISSING] w3m not found.")
+                    print("          Install with:", INSTALL_HINTS["w3m"])
+                else:
+                    run_cmd = ["bash", "-c", f"w3m {file}"]
+                    out, err = run_in_container_fs(rootdir, run_cmd, use_chroot, meta)
+                    if out:
+                        print(color + out.decode(errors="ignore") + RESET, end="")
+                    if err:
+                        print(color + err.decode(errors="ignore") + RESET, end="")
                 continue
 
-            # SH
+            # Shell script -------------------------------------------------
             if file.endswith(".sh"):
-                subprocess.run(["bash", file], cwd=rootfs)
+                run_cmd = ["bash", "-c", f"bash {file}"]
+                out, err = run_in_container_fs(rootdir, run_cmd, use_chroot, meta)
+                if out:
+                    print(color + out.decode(errors="ignore") + RESET, end="")
+                if err:
+                    print(color + err.decode(errors="ignore") + RESET, end="")
                 continue
 
-        # Normal Linux commands inside rootfs
-        p = subprocess.Popen(
-            ["bash","-c",cmd],
-            cwd=rootfs,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        out, err = p.communicate()
+            print("Unsupported file type for 'run'.")
+            continue
+
+        # Normal Linux command inside container fs ------------------------
+        out, err = run_in_container_fs(rootdir, ["bash", "-c", cmd], use_chroot, meta)
 
         if out:
             print(color + out.decode(errors="ignore") + RESET, end="")
@@ -290,7 +681,7 @@ Zocker Shell Commands:
 
 
 # ============================================================
-#   RUN CONTAINER (START SHELL)
+#  RUN (WITH OVERLAY + CGROUPS)
 # ============================================================
 
 def cmd_run():
@@ -300,24 +691,44 @@ def cmd_run():
 
     name = sys.argv[2]
     meta = load_meta(name)
-
     if not meta:
         print("Container not found.")
         return
 
-    # Assign fake PID
-    if meta["pid"] is None:
-        meta["pid"] = random.randint(20000, 50000)
+    # Try overlay mount
+    rootdir, overlay_active = setup_overlay(name)
+    meta["overlay"] = overlay_active
 
+    # Setup cgroup (best-effort)
+    cg_path = setup_cgroup(name, meta)
+
+    # Fake PID for visual effect
+    if meta.get("pid") is None:
+        meta["pid"] = random.randint(20000, 50000)
     meta["status"] = "running"
     save_meta(name, meta)
 
     print(f"Container {name} started (PID={meta['pid']})")
-    container_shell(name)
+    print(f"(rootdir: {rootdir})")
+    if cg_path:
+        print(f"(cgroup: {cg_path})")
+
+    try:
+        container_shell(name, rootdir)
+    finally:
+        # on leaving shell: mark stopped, unmount overlay if needed
+        teardown_overlay(name, overlay_active)
+        meta = load_meta(name) or {}
+        meta["status"] = "stopped"
+        meta["pid"] = None
+        meta["overlay"] = False
+        teardown_cgroup(meta)
+        save_meta(name, meta)
+        print(f"Container {name} stopped.")
 
 
 # ============================================================
-#   STOP CONTAINER
+#  STOP / STOP-ALL
 # ============================================================
 
 def cmd_stop():
@@ -327,46 +738,43 @@ def cmd_stop():
 
     name = sys.argv[2]
     meta = load_meta(name)
-
     if not meta:
         print("Container not found.")
         return
 
-    if meta["status"] != "running":
-        print("Process not running.")
-        return
-
+    # Nothing actually running in background; just update status
     meta["status"] = "stopped"
     meta["pid"] = None
+    meta["overlay"] = False
+    teardown_cgroup(meta)
     save_meta(name, meta)
 
-    print(f"Container {name} stopped.")
+    # Also try to unmount overlay if left mounted
+    teardown_overlay(name, True)
+    print("Stopped:", name)
 
 
-# ============================================================
-#   STOP ALL CONTAINERS
-# ============================================================
 def cmd_stop_all():
-    print("Stopping ALL running containers...\n")
-
+    print("Stopping ALL containers...")
     for folder in CONTAINERS_ROOT.iterdir():
         meta_file = folder / "meta.json"
         if not meta_file.exists():
             continue
-
-        meta = json.load(open(meta_file))
-
-        if meta["status"] == "running":
-            meta["status"] = "stopped"
-            meta["pid"] = None
-            save_meta(meta["name"], meta)
-            print(f"Stopped: {meta['name']}")
-
-    print("\nAll running containers stopped.")
+        with open(meta_file, "r") as f:
+            meta = json.load(f)
+        name = meta.get("name")
+        meta["status"] = "stopped"
+        meta["pid"] = None
+        meta["overlay"] = False
+        teardown_cgroup(meta)
+        save_meta(name, meta)
+        teardown_overlay(name, True)
+        print("Stopped:", name)
+    print("Done.")
 
 
 # ============================================================
-#   REMOVE CONTAINER
+#  REMOVE / RM-ALL
 # ============================================================
 
 def cmd_rm():
@@ -375,86 +783,76 @@ def cmd_rm():
         return
 
     name = sys.argv[2]
-    meta = load_meta(name)
-
-    if not meta:
+    folder = CONTAINERS_ROOT / name
+    if not folder.exists():
         print("Container not found.")
         return
 
-    if meta["status"] != "stopped":
-        print("Stop container first.")
+    meta = load_meta(name)
+    if meta and meta.get("status") == "running":
+        print("Container is running; stop it first.")
         return
 
-    shutil.rmtree(CONTAINERS_ROOT / name)
-    print(f"Container {name} removed.")
+    if meta:
+        teardown_cgroup(meta)
+    teardown_overlay(name, True)
+    shutil.rmtree(folder)
+    print("Removed:", name)
 
 
-# ============================================================
-#   REMOVE ALL STOPPED CONTAINERS
-# ============================================================
 def cmd_rm_all():
-    print("Removing ALL stopped containers...\n")
-
-    removed_any = False
-
+    print("Removing ALL stopped containers...")
     for folder in CONTAINERS_ROOT.iterdir():
         meta_file = folder / "meta.json"
         if not meta_file.exists():
             continue
-
         meta = json.load(open(meta_file))
-
-        # only stopped containers can be removed
-        if meta["status"] == "stopped":
-            shutil.rmtree(folder)
-            print(f"Removed: {meta['name']}")
-            removed_any = True
-
-    if not removed_any:
-        print("No stopped containers to remove.")
-    else:
-        print("\nAll stopped containers removed.")
+        name = meta.get("name")
+        if meta.get("status") == "running":
+            print(f"Skipping running container: {name}")
+            continue
+        teardown_cgroup(meta)
+        teardown_overlay(name, True)
+        shutil.rmtree(folder)
+        print("Removed:", name)
+    print("Done.")
 
 
 # ============================================================
-#   LIST CONTAINERS
+#  PS / LOGS / INSPECT
 # ============================================================
 
 def cmd_ps():
     rows = []
-    headers = ["Name", "PID", "Status", "Command"]
-
     for folder in CONTAINERS_ROOT.iterdir():
         meta_file = folder / "meta.json"
-        if meta_file.exists():
-            m = json.load(open(meta_file))
-            rows.append([
-                m["name"],
-                str(m["pid"]),
-                m["status"],
-                " ".join(m["command"])
-            ])
+        if not meta_file.exists():
+            continue
+        m = json.load(open(meta_file))
+        rows.append([
+            m.get("name", ""),
+            str(m.get("pid", "")),
+            m.get("status", ""),
+            " ".join(m.get("command", []))
+        ])
 
     if not rows:
         print("No containers found.")
         return
 
-    # table formatting
     print("+----------------------+--------+----------+-------------------------------+")
-    print("| {:<20} | {:<6} | {:<8} | {:<29} |".format(*headers))
+    print("| Name                 | PID    | Status   | Command                       |")
     print("+----------------------+--------+----------+-------------------------------+")
-
     for r in rows:
         print("| {:<20} | {:<6} | {:<8} | {:<29} |".format(*r))
-
     print("+----------------------+--------+----------+-------------------------------+")
 
 
-# ============================================================
-#   LOGS
-# ============================================================
-
 def cmd_logs():
+    if len(sys.argv) < 3:
+        print("Usage: zocker logs <name>")
+        return
+
     name = sys.argv[2]
     log_file = CONTAINERS_ROOT / name / "logs.txt"
     if log_file.exists():
@@ -463,11 +861,11 @@ def cmd_logs():
         print("No logs found.")
 
 
-# ============================================================
-#   INSPECT
-# ============================================================
-
 def cmd_inspect():
+    if len(sys.argv) < 3:
+        print("Usage: zocker inspect <name>")
+        return
+
     name = sys.argv[2]
     meta_file = CONTAINERS_ROOT / name / "meta.json"
     if meta_file.exists():
@@ -477,95 +875,92 @@ def cmd_inspect():
 
 
 # ============================================================
-#   EXPORT CONTAINER (SAVE AS .tar)
+#  EXPORT / IMPORT
 # ============================================================
+
 def cmd_export():
     if len(sys.argv) < 4:
-        print("Usage: zocker export <name> <output.tar>")
+        print("Usage: zocker export <name> <file.tar>")
         return
 
     name = sys.argv[2]
     outfile = sys.argv[3]
-
     container_path = CONTAINERS_ROOT / name
 
     if not container_path.exists():
         print("Container not found.")
         return
 
-    # make tar file
-    shutil.make_archive(outfile.replace(".tar",""), 'tar', container_path)
-
+    base = outfile.replace(".tar", "")
+    shutil.make_archive(base, "tar", container_path)
     print(f"Container '{name}' exported to: {outfile}")
 
 
-# ============================================================
-#   IMPORT CONTAINER (LOAD FROM .tar)
-# ============================================================
 def cmd_import():
     if len(sys.argv) < 3:
         print("Usage: zocker import <file.tar>")
         return
 
     tarfile = sys.argv[2]
-
     if not Path(tarfile).exists():
         print("File not found:", tarfile)
         return
 
-    # assign new name so no conflict
     newname = generate_name()
     newpath = CONTAINERS_ROOT / newname
-    newpath.mkdir()
+    newpath.mkdir(parents=True)
 
-    # extract tar
     shutil.unpack_archive(tarfile, newpath)
 
-    # fix metadata name
     meta_file = newpath / "meta.json"
     if meta_file.exists():
         meta = json.load(open(meta_file))
         meta["name"] = newname
         meta["pid"] = None
+        meta["overlay"] = False
         save_meta(newname, meta)
 
     print(f"Container imported as: {newname}")
 
 
-
 # ============================================================
-#   COMMAND ROUTER
+#  COMMAND ROUTER
 # ============================================================
 
-if len(sys.argv) < 2:
-    print("No command.")
-    sys.exit(1)
+def main():
+    if len(sys.argv) < 2:
+        print("No command given.")
+        sys.exit(1)
 
-cmd = sys.argv[1]
+    cmd = sys.argv[1]
 
-if cmd == "create":
-    cmd_create()
-elif cmd == "build":
-    cmd_build()
-elif cmd == "run":
-    cmd_run()
-elif cmd == "stop":
-    cmd_stop()
-elif cmd == "stop-all":
-    cmd_stop_all()
-elif cmd == "rm":
-    cmd_rm()
-elif cmd == "rm-all":
-    cmd_rm_all()
-elif cmd == "export":
-    cmd_export()
-elif cmd == "import":
-    cmd_import()
-elif cmd == "ps":
-    cmd_ps()
-elif cmd == "logs":
-    cmd_logs()
-elif cmd == "inspect":
-    cmd_inspect()
-else:
-    print("Unknown command:", cmd)
+    if cmd == "create":
+        cmd_create()
+    elif cmd == "build":
+        cmd_build()
+    elif cmd == "run":
+        cmd_run()
+    elif cmd == "stop":
+        cmd_stop()
+    elif cmd == "stop-all":
+        cmd_stop_all()
+    elif cmd == "rm":
+        cmd_rm()
+    elif cmd == "rm-all":
+        cmd_rm_all()
+    elif cmd == "ps":
+        cmd_ps()
+    elif cmd == "logs":
+        cmd_logs()
+    elif cmd == "inspect":
+        cmd_inspect()
+    elif cmd == "export":
+        cmd_export()
+    elif cmd == "import":
+        cmd_import()
+    else:
+        print("Unknown command:", cmd)
+
+
+if _name_ == "_main_":
+    main()
